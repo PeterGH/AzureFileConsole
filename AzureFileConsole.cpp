@@ -9,6 +9,42 @@ namespace AzureFileConsole
     using namespace utility;
     using namespace azure::storage;
 
+    class Util
+    {
+    public:
+        static vector<string_t> Split(const string_t& input, const string_t& delimiters)
+        {
+            vector<string_t> result;
+            size_t start = 0;
+
+            while (start < input.size())
+            {
+                size_t end = start;
+
+                while (end < input.size()
+                    && std::find(delimiters.begin(), delimiters.end(), input[end]) == delimiters.end())
+                {
+                    end++;
+                }
+
+                if (start < end)
+                {
+                    result.push_back(input.substr(start, end - start));
+                }
+
+                start = end;
+
+                while (start < input.size()
+                    && std::find(delimiters.begin(), delimiters.end(), input[start]) != delimiters.end())
+                {
+                    start++;
+                }
+            }
+
+            return result;
+        }
+    };
+
     class AzureFileContext
     {
     public:
@@ -92,6 +128,8 @@ namespace AzureFileConsole
     public:
         virtual string_t GetFileName(const string_t& path) = 0;
         virtual bool IsDirectory(const string_t& path) = 0;
+        virtual void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action) = 0;
+        virtual string_t GetRelativePath(const string_t& parent, const string_t& fullPath) = 0;
     };
 
     class FileSystem : public IFileSystem
@@ -103,6 +141,16 @@ namespace AzureFileConsole
         }
 
         bool IsDirectory(const string_t& path)
+        {
+            throw runtime_error("NotImplemented");
+        }
+
+        void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action)
+        {
+            throw runtime_error("NotImplemented");
+        }
+
+        string_t GetRelativePath(const string_t& parent, const string_t& fullPath)
         {
             throw runtime_error("NotImplemented");
         }
@@ -127,6 +175,137 @@ namespace AzureFileConsole
             }
 
             return ((dwAttrs & FILE_ATTRIBUTE_DIRECTORY) == FILE_ATTRIBUTE_DIRECTORY);
+        }
+
+        void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action)
+        {
+            if (path.empty())
+            {
+                throw invalid_argument("path");
+            }
+
+            queue<string_t> directories;
+            directories.push(path);
+
+            string_t currentDirectory;
+
+            while (!directories.empty())
+            {
+                currentDirectory = directories.front();
+                directories.pop();
+                ProcessDirectory(currentDirectory, directories, action);
+            }
+        }
+
+        string_t GetRelativePath(const string_t& parent, const string_t& fullPath)
+        {
+            string_t relativePath = fullPath;
+            size_t length = parent.size();
+
+            if (fullPath.substr(0, length).compare(parent) == 0)
+            {
+                relativePath = fullPath.substr(length);
+            }
+
+            if (relativePath.front() == _XPLATSTR('\\'))
+            {
+                relativePath = relativePath.substr(1);
+            }
+
+            return relativePath;
+        }
+
+    private:
+
+        void ProcessDirectory(const string_t& directory, queue<string_t>& directories, const function<void(const string_t&)>& action)
+        {
+            WIN32_FIND_DATA findData;
+            HANDLE hFind = INVALID_HANDLE_VALUE;
+            DWORD dwError = 0;
+
+            try
+            {
+                string_t pattern = BuildSearchPattern(directory);
+
+                hFind = FindFirstFile(pattern.c_str(), &findData);
+
+                if (hFind == INVALID_HANDLE_VALUE)
+                {
+                    dwError = GetLastError();
+                    ucout << _XPLATSTR("Failed to find ") << pattern << ", last error: " << dwError << endl;
+                    return;
+                }
+
+                do
+                {
+                    if (_wcsicmp(findData.cFileName, L".") == 0 || _wcsicmp(findData.cFileName, L"..") == 0)
+                    {
+                        continue;
+                    }
+
+                    string_t path = PathCombine(directory, string_t(findData.cFileName));
+
+                    if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == FILE_ATTRIBUTE_DIRECTORY)
+                    {
+                        directories.push(path);
+                    }
+                    else
+                    {
+                        action(path);
+                    }
+                } while (FindNextFile(hFind, &findData) != 0);
+            }
+            catch (const std::exception& e)
+            {
+                ucout << e.what() << endl;
+            }
+
+            if (hFind != INVALID_HANDLE_VALUE)
+            {
+                FindClose(hFind);
+                hFind = INVALID_HANDLE_VALUE;
+            }
+        }
+
+        static string_t BuildSearchPattern(const string_t& path)
+        {
+            string_t pattern = path;
+
+            if (pattern.back() != _XPLATSTR('\\'))
+            {
+                pattern.append(1, _XPLATSTR('\\'));
+            }
+
+            pattern.append(1, _XPLATSTR('*'));
+            return pattern;
+        }
+
+        static string_t PathCombine(const string_t& parent, const string_t& child)
+        {
+            string_t path = parent;
+
+            if (path.back() == _XPLATSTR('\\'))
+            {
+                if (child.front() == _XPLATSTR('\\'))
+                {
+                    path.append(child.substr(1));
+                }
+                else
+                {
+                    path.append(child);
+                }
+            }
+            else
+            {
+                if (child.front() != _XPLATSTR('\\'))
+                {
+                    path.append(1, _XPLATSTR('\\'));
+                }
+
+                path.append(child);
+            }
+
+            return path;
         }
     };
 
@@ -283,6 +462,10 @@ namespace AzureFileConsole
                     m_context.CurrentDirectory(m_context.CurrentShare().get_root_directory_reference());
                     m_context.CurrentUri(m_context.CurrentDirectory().uri().primary_uri().to_string());
                 }
+                else
+                {
+                    throw invalid_argument("Invalid share name");
+                }
             }
             else
             {
@@ -308,8 +491,17 @@ namespace AzureFileConsole
                 }
                 else if (directory_name.compare(_XPLATSTR(".")) != 0)
                 {
-                    m_context.CurrentDirectory(m_context.CurrentDirectory().get_subdirectory_reference(directory_name));
-                    m_context.CurrentUri(m_context.CurrentDirectory().uri().primary_uri().to_string());
+                    cloud_file_directory subdir = m_context.CurrentDirectory().get_subdirectory_reference(directory_name);
+
+                    if (subdir.exists())
+                    {
+                        m_context.CurrentDirectory(subdir);
+                        m_context.CurrentUri(m_context.CurrentDirectory().uri().primary_uri().to_string());
+                    }
+                    else
+                    {
+                        throw invalid_argument("Invalid directory name");
+                    }
                 }
             }
         }
@@ -334,12 +526,6 @@ namespace AzureFileConsole
             {
                 throw invalid_argument("Not in a share root directory");
             }
-
-            string_t path = m_arguments[0];
-            if (m_file_system->IsDirectory(path))
-            {
-                throw invalid_argument("Directory");
-            }
         }
 
         void Execute()
@@ -347,17 +533,44 @@ namespace AzureFileConsole
             string_t path = m_arguments[0];
             string_t fileName;
 
-            if (m_arguments.size() > 1)
+            if (m_file_system->IsDirectory(path))
             {
-                fileName = m_arguments[1];
+                m_file_system->ProcessDirectories(path, [&](const string_t& p)
+                {
+                    string_t relativePath = m_file_system->GetRelativePath(path, p);
+                    vector<string_t> parts = Util::Split(relativePath, _XPLATSTR("\\"));
+                    cloud_file_directory currentDir = m_context.CurrentDirectory();
+                    size_t i = 0;
+
+                    for (i = 0; i < parts.size() - 1; i++)
+                    {
+                        if (parts[i].size() > 0)
+                        {
+                            currentDir = currentDir.get_subdirectory_reference(parts[i]);
+                            currentDir.create_if_not_exists();
+                        }
+                    }
+
+                    fileName = parts[i];
+                    cloud_file file = currentDir.get_file_reference(fileName);
+                    file.upload_from_file(p);
+                    ucout << "Uploaded " << p << endl;
+                });
             }
             else
             {
-                fileName = m_file_system->GetFileName(path);
-            }
+                if (m_arguments.size() > 1)
+                {
+                    fileName = m_arguments[1];
+                }
+                else
+                {
+                    fileName = m_file_system->GetFileName(path);
+                }
 
-            cloud_file file = m_context.CurrentDirectory().get_file_reference(fileName);
-            file.upload_from_file(path);
+                cloud_file file = m_context.CurrentDirectory().get_file_reference(fileName);
+                file.upload_from_file(path);
+            }
         }
     };
 
