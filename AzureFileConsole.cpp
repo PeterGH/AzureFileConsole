@@ -6,6 +6,7 @@
 namespace AzureFileConsole
 {
     using namespace std;
+    using namespace concurrency;
     using namespace utility;
     using namespace azure::storage;
 
@@ -128,7 +129,10 @@ namespace AzureFileConsole
     public:
         virtual string_t GetFileName(const string_t& path) = 0;
         virtual bool IsDirectory(const string_t& path) = 0;
-        virtual void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action) = 0;
+        virtual void ProcessDirectories(
+            const string_t& path,
+            const function<void(const string_t&)>& actionOnDirectory,
+            const function<void(const string_t&)>& actionOnFile) = 0;
         virtual string_t GetRelativePath(const string_t& parent, const string_t& fullPath) = 0;
     };
 
@@ -145,7 +149,10 @@ namespace AzureFileConsole
             throw runtime_error("NotImplemented");
         }
 
-        void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action)
+        void ProcessDirectories(
+            const string_t& path,
+            const function<void(const string_t&)>& actionOnDirectory,
+            const function<void(const string_t&)>& actionOnFile)
         {
             throw runtime_error("NotImplemented");
         }
@@ -177,7 +184,10 @@ namespace AzureFileConsole
             return ((dwAttrs & FILE_ATTRIBUTE_DIRECTORY) == FILE_ATTRIBUTE_DIRECTORY);
         }
 
-        void ProcessDirectories(const string_t& path, const function<void(const string_t&)>& action)
+        void ProcessDirectories(
+            const string_t& path,
+            const function<void(const string_t&)>& actionOnDirectory,
+            const function<void(const string_t&)>& actionOnFile)
         {
             if (path.empty())
             {
@@ -193,7 +203,7 @@ namespace AzureFileConsole
             {
                 currentDirectory = directories.front();
                 directories.pop();
-                ProcessDirectory(currentDirectory, directories, action);
+                ProcessDirectory(currentDirectory, directories, actionOnDirectory, actionOnFile);
             }
         }
 
@@ -204,10 +214,17 @@ namespace AzureFileConsole
 
             if (fullPath.substr(0, length).compare(parent) == 0)
             {
-                relativePath = fullPath.substr(length);
+                if (length < fullPath.size())
+                {
+                    relativePath = fullPath.substr(length);
+                }
+                else
+                {
+                    relativePath = string_t();
+                }
             }
 
-            if (relativePath.front() == _XPLATSTR('\\'))
+            if (relativePath.size() > 0 && relativePath.front() == _XPLATSTR('\\'))
             {
                 relativePath = relativePath.substr(1);
             }
@@ -217,7 +234,11 @@ namespace AzureFileConsole
 
     private:
 
-        void ProcessDirectory(const string_t& directory, queue<string_t>& directories, const function<void(const string_t&)>& action)
+        void ProcessDirectory(
+            const string_t& directory,
+            queue<string_t>& directories,
+            const function<void(const string_t&)>& actionOnDirectory,
+            const function<void(const string_t&)>& actionOnFile)
         {
             WIN32_FIND_DATA findData;
             HANDLE hFind = INVALID_HANDLE_VALUE;
@@ -225,6 +246,8 @@ namespace AzureFileConsole
 
             try
             {
+                actionOnDirectory(directory);
+
                 string_t pattern = BuildSearchPattern(directory);
 
                 hFind = FindFirstFile(pattern.c_str(), &findData);
@@ -236,6 +259,7 @@ namespace AzureFileConsole
                     return;
                 }
 
+                vector<pplx::task<void>> fileActions;
                 do
                 {
                     if (_wcsicmp(findData.cFileName, L".") == 0 || _wcsicmp(findData.cFileName, L"..") == 0)
@@ -251,9 +275,16 @@ namespace AzureFileConsole
                     }
                     else
                     {
-                        action(path);
+                        pplx::task<void> action([=]()->void
+                        {
+                            actionOnFile(path);
+                        });
+
+                        fileActions.push_back(action);
                     }
                 } while (FindNextFile(hFind, &findData) != 0);
+
+                pplx::when_all(fileActions.begin(), fileActions.end()).wait();
             }
             catch (const std::exception& e)
             {
@@ -535,27 +566,48 @@ namespace AzureFileConsole
 
             if (m_file_system->IsDirectory(path))
             {
-                m_file_system->ProcessDirectories(path, [&](const string_t& p)
-                {
-                    string_t relativePath = m_file_system->GetRelativePath(path, p);
-                    vector<string_t> parts = Util::Split(relativePath, _XPLATSTR("\\"));
-                    cloud_file_directory currentDir = m_context.CurrentDirectory();
-                    size_t i = 0;
-
-                    for (i = 0; i < parts.size() - 1; i++)
+                m_file_system->ProcessDirectories(
+                    path,
+                    [&, path](const string_t& d)
                     {
-                        if (parts[i].size() > 0)
-                        {
-                            currentDir = currentDir.get_subdirectory_reference(parts[i]);
-                            currentDir.create_if_not_exists();
-                        }
-                    }
+                        string_t relativePath = m_file_system->GetRelativePath(path, d);
 
-                    fileName = parts[i];
-                    cloud_file file = currentDir.get_file_reference(fileName);
-                    file.upload_from_file(p);
-                    ucout << "Uploaded " << p << endl;
-                });
+                        if (relativePath.size() > 0)
+                        {
+                            vector<string_t> parts = Util::Split(relativePath, _XPLATSTR("\\"));
+                            cloud_file_directory currentDir = m_context.CurrentDirectory();
+                            size_t i = 0;
+
+                            for (i = 0; i < parts.size(); i++)
+                            {
+                                if (parts[i].size() > 0)
+                                {
+                                    currentDir = currentDir.get_subdirectory_reference(parts[i]);
+                                    currentDir.create_if_not_exists();
+                                }
+                            }
+                        }
+                    },
+                    [&, path](const string_t& f)
+                    {
+                        string_t relativePath = m_file_system->GetRelativePath(path, f);
+                        vector<string_t> parts = Util::Split(relativePath, _XPLATSTR("\\"));
+                        cloud_file_directory currentDir = m_context.CurrentDirectory();
+                        size_t i = 0;
+
+                        for (i = 0; i < parts.size() - 1; i++)
+                        {
+                            if (parts[i].size() > 0)
+                            {
+                                currentDir = currentDir.get_subdirectory_reference(parts[i]);
+                            }
+                        }
+
+                        fileName = parts[i];
+                        cloud_file file = currentDir.get_file_reference(fileName);
+                        file.upload_from_file(f);
+                        ucout << "Uploaded " << f << endl;
+                    });
             }
             else
             {
@@ -571,6 +623,82 @@ namespace AzureFileConsole
                 cloud_file file = m_context.CurrentDirectory().get_file_reference(fileName);
                 file.upload_from_file(path);
             }
+        }
+    };
+
+    class DeleteCommand : public CommandBase
+    {
+    public:
+        DeleteCommand(const string_t& command, const vector<string_t>& arguments, AzureFileContext& context, const shared_ptr<IFileSystem>& file_system)
+            : CommandBase(command, arguments, context, file_system)
+        {
+        }
+
+        void PreExecute()
+        {
+            if (m_arguments.size() == 0)
+            {
+                throw invalid_argument("Missing arguments");
+            }
+
+            if (!m_context.CurrentShare().is_valid())
+            {
+                throw invalid_argument("Not in a share root directory");
+            }
+        }
+
+        void Execute()
+        {
+            string_t itemName = m_arguments[0];
+            cloud_file file = m_context.CurrentDirectory().get_file_reference(itemName);
+
+            if (file.delete_file_if_exists())
+            {
+                return;
+            }
+
+            cloud_file_directory directory = m_context.CurrentDirectory().get_subdirectory_reference(itemName);
+            DeleteDirectory(directory).wait();
+        }
+
+    private:
+        static pplx::task<void> DeleteDirectory(cloud_file_directory directory)
+        {
+            vector<pplx::task<void>> deleteDirectories;
+            vector<pplx::task<void>> deleteFiles;
+
+            continuation_token token;
+
+            do
+            {
+                list_file_and_directory_result_segment result = directory.list_files_and_directories_segmented(token);
+
+                for (auto& item : result.results())
+                {
+                    if (item.is_directory())
+                    {
+                        deleteDirectories.push_back(pplx::task<void>([item]()->void
+                        {
+                            DeleteDirectory(item.as_directory()).wait();
+                        }));
+                    }
+                    else if (item.is_file())
+                    {
+                        deleteFiles.push_back(pplx::task<void>([item]()->void
+                        {
+                            cloud_file file = item.as_file();
+                            file.delete_file();
+                        }));
+                    }
+                }
+            } while (!token.empty());
+
+            return pplx::when_all(deleteFiles.begin(), deleteFiles.end()).then([deleteDirectories]()->void {
+                pplx::when_all(deleteDirectories.begin(), deleteDirectories.end()).wait();
+            }).then([directory]()->void {
+                cloud_file_directory dir = directory;
+                dir.delete_directory();
+            });
         }
     };
 
@@ -609,6 +737,10 @@ namespace AzureFileConsole
             else if (command.compare(_XPLATSTR("upload")) == 0)
             {
                 return shared_ptr<ICommand>(new UploadCommand(command, arguments, context, file_system));
+            }
+            else if (command.compare(_XPLATSTR("delete")) == 0)
+            {
+                return shared_ptr<ICommand>(new DeleteCommand(command, arguments, context, file_system));
             }
             else
             {

@@ -15,6 +15,7 @@
 // TODO: reference additional headers your program requires here
 #include <string>
 #include "cpprest\details\basic_types.h"
+#include "pplx\pplxtasks.h"
 #include "was\core.h"
 #include "was\storage_account.h"
 #include "was\file.h"
